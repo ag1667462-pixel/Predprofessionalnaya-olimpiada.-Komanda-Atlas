@@ -1,0 +1,196 @@
+import cv2
+import numpy as np
+import serial
+import time
+import math
+
+class RobotCollector:
+    def init(self):  # Исправлена опечатка: init -> init
+        self.cylinders_collected = 0
+        self.MAX_CYLINDERS = 8
+        self.state = "SEARCH"
+        self.arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+        time.sleep(2)
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        self.red_lower1 = np.array([0, 120, 70])
+        self.red_upper1 = np.array([10, 255, 255])
+        self.red_lower2 = np.array([170, 120, 70])
+        self.red_upper2 = np.array([180, 255, 255])
+        self.blue_lower = np.array([100, 150, 0])
+        self.blue_upper = np.array([140, 255, 255])
+        self.green_lower = np.array([45, 100, 100])
+        self.green_upper = np.array([75, 255, 255])
+    
+    def send_move(self, direction, duration=1.0):
+        self.arduino.write(direction.encode())
+        time.sleep(duration)
+        self.arduino.write(b'S')
+        time.sleep(0.2)
+    
+    # Основное серво захвата (X - открыть, w - закрыть)
+    def servo_open(self):
+        # Перед открытием опускаем платформу на 0 градусов
+        self.arduino.write(b'D')  # D - платформа вниз (0 градусов)
+        time.sleep(0.5)
+        self.arduino.write(b'X')  # Открываем захват
+        time.sleep(0.5)
+    
+    def servo_close(self):
+        self.arduino.write(b'w')  # Закрываем захват
+        time.sleep(0.5)
+        # После закрытия поворачиваем платформу на 90 градусов вверх
+        self.arduino.write(b'U')  # U - платформа вверх (90 градусов)
+        time.sleep(0.5)
+    
+    # Проверка прямоугольника
+    def is_rectangle(self, contour):
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        return len(approx) >= 4
+    
+    # Проверка цилиндра
+    def is_cylinder(self, contour):
+        area = cv2.contourArea(contour)
+        (x, y), radius = cv2.minEnclosingCircle(contour)
+        peri = cv2.arcLength(contour, True)
+        circularity = 4 * math.pi * area / (peri * peri) if peri > 0 else 0
+        return 0.7 < circularity < 1.0
+    
+    # Захват близкого цилиндра
+    def process_near_cylinder(self):
+        self.servo_open()  # Теперь включает спуск платформы
+        self.send_move('F', 1.5)
+        self.send_move('B', 1.0)
+        self.send_move('R', 0.8)
+        self.send_move('F', 0.7)
+        self.servo_close()  # Теперь включает поворот платформы вверх
+        self.send_move('B', 0.7)
+        self.cylinders_collected += 1
+        self.state = "SEARCH"
+    
+    # Захват дальнего цилиндра
+    def process_far_cylinder(self):
+        self.send_move('F', 1.5)
+        self.send_move('L', 0.7)
+        self.send_move('R', 1.0)
+        self.send_move('R', 1.0)
+        self.servo_open()  # Спуск платформы + открытие захвата
+        self.send_move('F', 1.2)
+        self.servo_close()  # Закрытие захвата + поворот платформы вверх
+        self.send_move('B', 1.2)
+        self.send_move('L', 1.0)
+        self.send_move('L', 0.7)
+        self.send_move('B', 1.5)
+        self.cylinders_collected += 1
+        self.state = "SEARCH"
+    
+    # Реакция на прямоугольники
+    def process_rectangles(self, objects):
+        frame_center = 320
+        for obj in objects:
+            if obj['is_rect'] and 2000 < obj['area'] < 15000:
+                x_center = obj['x']
+                if obj['color'] == 'red':
+                    if x_center < frame_center - 50:
+                        self.send_move('R', 0.4)
+                    elif x_center > frame_center + 50:
+                        self.send_move('L', 0.4)
+                    else:
+                        self.send_move('F', 0.6)
+                elif obj['color'] == 'blue':
+                    self.send_move('L', 0.5)
+                elif obj['color'] == 'green':
+                    self.send_move('R', 0.5)
+    
+    # Основной цикл
+    def run(self):
+        while self.cylinders_collected < self.MAX_CYLINDERS:
+ret, frame = self.cap.read()
+            if not ret:
+                continue
+            
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            
+            # Создание масок
+            mask_red1 = cv2.inRange(hsv, self.red_lower1, self.red_upper1)
+            mask_red2 = cv2.inRange(hsv, self.red_lower2, self.red_upper2)
+            mask_red = mask_red1 + mask_red2
+            mask_blue = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
+            mask_green = cv2.inRange(hsv, self.green_lower, self.green_upper)
+            
+            # Поиск контуров
+            contours_red = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+            contours_blue = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+            contours_green = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+            
+            objects = []
+            
+            # Анализ объектов
+            for contours, color in [(contours_red, 'red'), (contours_blue, 'blue'), (contours_green, 'green')]:
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area > 800:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        obj = {
+                            'color': color,
+                            'area': area,
+                            'x': x + w//2,
+                            'y': y + h//2,
+                            'w': w, 'h': h,
+                            'contour': cnt,
+                            'is_rect': self.is_rectangle(cnt),
+                            'is_cyl': self.is_cylinder(cnt)
+                        }
+                        objects.append(obj)
+            
+            # Логика состояний
+            large_objects = [obj for obj in objects if obj['area'] > 15000]
+            medium_objects = [obj for obj in objects if 2000 < obj['area'] < 15000]
+            
+            if large_objects and self.state == "SEARCH":
+                cylinder = next((obj for obj in large_objects if obj['is_cyl']), None)
+                if cylinder:
+                    self.state = "COLLECT_NEAR" if cylinder['area'] > 25000 else "COLLECT_FAR"
+                    time.sleep(1)
+            
+            elif self.state == "COLLECT_NEAR":
+                self.process_near_cylinder()
+            
+            elif self.state == "COLLECT_FAR":
+                self.process_far_cylinder()
+            
+            elif medium_objects:
+                self.process_rectangles(medium_objects)
+            
+            # Отрисовка
+            for obj in objects:
+                color = (0, 0, 255) if obj['is_cyl'] else (0, 255, 0)
+                cv2.rectangle(frame, (obj['x']-obj['w']//2, obj['y']-obj['h']//2),
+                           (obj['x']+obj['w']//2, obj['y']+obj['h']//2), color, 2)
+                shape = "CYL" if obj['is_cyl'] else "RECT"
+                cv2.putText(frame, f"{obj['color']}-{shape}({obj['area']})",
+                           (obj['x'], obj['y']-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Информация
+            cv2.putText(frame, f"State: {self.state}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, f"Cylinders: {self.cylinders_collected}/8", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            cv2.imshow('Robot', frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        self.arduino.write(b'S')
+        self.cap.release()
+        cv2.destroyAllWindows()
+        self.arduino.close()
+
+if name == "main":  # Исправлена опечатка: name -> name
+    robot = RobotCollector()
+    robot.run()
+
